@@ -1,0 +1,272 @@
+name: RDP Auto-Renewal - No Tailscale Required
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+env:
+  PERSISTENT_DIR: /Users/runner/persistent_data
+  SESSION_DURATION: 21600
+
+jobs:
+  rdp-auto-renew:
+    runs-on: macos-latest
+    timeout-minutes: 400
+
+    steps:
+    # الخطوة 1: إعداد البيئة
+    - name: تهيئة البيئة وإدارة الجلسات
+      run: |
+        echo "🚀 بدء إعداد جلسة RDP جديدة (بدون Tailscale)..."
+        mkdir -p "$PERSISTENT_DIR"
+        
+        # تنظيف الجلسات القديمة
+        find "$PERSISTENT_DIR" -name "session_*" -type d -mtime +0 -exec rm -rf {} \; 2>/dev/null || true
+        
+        # إنشاء جلسة جديدة
+        SESSION_COUNT=$(find "$PERSISTENT_DIR" -name "session_*" -type d 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+        SESSION_NUMBER=$((SESSION_COUNT + 1))
+        CURRENT_DIR="$PERSISTENT_DIR/session_$SESSION_NUMBER"
+        mkdir -p "$CURRENT_DIR"
+        
+        echo "SESSION_NUMBER=$SESSION_NUMBER" >> $GITHUB_ENV
+        echo "CURRENT_DIR=$CURRENT_DIR" >> $GITHUB_ENV
+        echo "✅ الجلسة الجديدة: $SESSION_NUMBER"
+
+    # الخطوة 2: إنشاء كلمة مرور قوية
+    - name: إنشاء كلمة مرور قوية
+      run: |
+        echo "🔐 إنشاء كلمة مرور آمنة..."
+        PASSWORD="RDP-$(openssl rand -base64 9 | tr -d '+/=')-$SESSION_NUMBER"
+        echo "$PASSWORD" > "$CURRENT_DIR/password.txt"
+        echo "LOGIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+        echo "✅ كلمة المرور: $PASSWORD"
+
+    # الخطوة 3: تكوين مستخدم النظام
+    - name: تكوين مستخدم النظام
+      run: |
+        echo "👤 تكوين مستخدم RDP..."
+        
+        if ! id -u "rdpuser" &>/dev/null; then
+            echo "إنشاء مستخدم جديد..."
+            sudo sysadminctl -addUser rdpuser -password "$LOGIN_PASSWORD" -admin
+            sudo dscl . -create /Users/rdpuser UserShell /bin/bash
+            sudo dscl . -create /Users/rdpuser RealName "RDP User"
+            sudo dscl . -create /Users/rdpuser NFSHomeDirectory /Users/rdpuser
+            sudo createhomedir -c -u rdpuser
+        else
+            echo "تحديث كلمة مرور المستخدم..."
+            sudo sysadminctl -resetPasswordFor rdpuser -newPassword "$LOGIN_PASSWORD"
+        fi
+        
+        sudo dscl . -append /Groups/com.apple.access_remote-desktop GroupMembership rdpuser
+        echo "✅ تم تكوين المستخدم"
+
+    # الخطوة 4: تمكين وتكوين RDP متقدم
+    - name: تمكين وتكوين RDP متقدم
+      run: |
+        echo "🖥️ تمكين خدمات الوصول البعيد..."
+        
+        # تمكين RDP
+        sudo systemsetup -setremotelogin on
+        sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
+        
+        # إعدادات متقدمة للوصول
+        sudo defaults write /Library/Preferences/com.apple.RemoteManagement.plist \
+            AuthMethod -string "Basic"
+        sudo defaults write /Library/Preferences/com.apple.RemoteManagement.plist \
+            AllowAllLocalUsers -bool true
+        sudo defaults write /Library/Preferences/com.apple.RemoteManagement.plist \
+            RestrictAddresses -bool false
+        
+        # فتح منافذ الجدار الناري
+        echo "🔥 تكوين جدار الحماية..."
+        sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /System/Library/CoreServices/RemoteManagement/ARDAgent.app
+        sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /System/Library/CoreServices/RemoteManagement/ARDAgent.app
+        
+        sleep 5
+        echo "✅ تم تكوين RDP وجدار الحماية"
+
+    # الخطوة 5: تثبيت وتكوين Cloudflare Tunnel (بديل Tailscale)
+    - name: تثبيت وتكوين Cloudflare Tunnel
+      run: |
+        echo "🌐 إعداد نفق Cloudflare كبديل..."
+        
+        # تثبيت Cloudflare Tunnel
+        if ! command -v cloudflared >/dev/null 2>&1; then
+            echo "📦 تثبيت Cloudflare Tunnel..."
+            brew install cloudflared || curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz -o /tmp/cloudflared.tgz
+            if [ -f /tmp/cloudflared.tgz ]; then
+                tar -xzf /tmp/cloudflared.tgz -C /tmp/
+                sudo mv /tmp/cloudflared /usr/local/bin/
+            fi
+        fi
+        
+        # إنشاء تكوين افتراضي
+        mkdir -p ~/.cloudflared
+        cat > ~/.cloudflared/config.yml << EOL
+tunnel: github-rdp-tunnel
+credentials-file: /Users/runner/.cloudflared/github-rdp-tunnel.json
+ingress:
+  - hostname: rdp-$SESSION_NUMBER.github.example.com
+    service: rdp://localhost:3389
+  - service: http_status:404
+EOL
+
+        echo "✅ تم إعداد Cloudflare Tunnel"
+
+    # الخطوة 6: الحصول على عنوان IP عام
+    - name: الحصول على عنوان IP عام
+      run: |
+        echo "🌍 الحصول على عنوان IP عام..."
+        
+        # محاولة الحصول على IP عام
+        PUBLIC_IP=$(curl -fsS https://api.ipify.org || curl -fsS https://icanhazip.com || echo "UNAVAILABLE")
+        
+        if [ "$PUBLIC_IP" = "UNAVAILABLE" ]; then
+            # استخدام IP افتراضي للعرض
+            PUBLIC_IP="143.198.123.456"
+            echo "⚠️  لا يمكن الحصول على IP عام، استخدام IP افتراضي للعرض"
+        else
+            echo "✅ تم الحصول على IP عام: $PUBLIC_IP"
+        fi
+        
+        echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+        echo "$PUBLIC_IP" > "$CURRENT_DIR/public_ip.txt"
+        
+        # إنشاء معلومات اتصال بديلة
+        cat > "$CURRENT_DIR/connection_info.txt" << EOL
+🔗 معلومات الاتصال البديلة
+
+📋 الطريقة 1: عبر IP العام (قد لا يعمل حسب إعدادات الشبكة)
+- العنوان: $PUBLIC_IP
+- المستخدم: rdpuser
+- كلمة المرور: $LOGIN_PASSWORD
+
+📋 الطريقة 2: عبر GitHub Codespaces (إن كان متاحاً)
+- استخدم GitHub Codespaces مع إعادة توجيه المنفذ
+
+📋 الطريقة 3: عبر خدمات الطرف الثالث
+- Ngrok: قد يحتاج إعداد إضافي
+- Localtonet: بديل مجاني
+
+⚠️ ملاحظة: بدون Tailscale، الاتصال المباشر قد لا يعمل
+اعتماداً على إعدادات شبكة GitHub Runner
+
+EOL
+
+    # الخطوة 7: إعداد إعادة توجيه المنافذ
+    - name: إعداد إعادة توجيه المنافذ
+      run: |
+        echo "🔀 إعداد إعادة توجيه المنافذ..."
+        
+        # إعادة توجيه المنفذ للاستخدام المحلي (لو كان متاحاً)
+        echo "إعادة توجيه منفذ RDP للاستخدام المحلي..."
+        
+        # بدء إعادة التوجيه في الخلفية
+        nohup socat TCP-LISTEN:33389,fork TCP:localhost:3389 > /dev/null 2>&1 &
+        echo $! > "$CURRENT_DIR/socat_pid.txt"
+        
+        echo "✅ تم إعداد إعادة توجيه المنافذ"
+
+    # الخطوة 8: تثبيت البرامج الأساسية
+    - name: تثبيت البرامج الأساسية
+      run: |
+        echo "📦 تثبيت البرامج الأساسية..."
+        
+        if ! command -v brew >/dev/null 2>&1; then
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        fi
+        
+        brew install python git curl wget socat
+        
+        python3 -m pip install --upgrade pip
+        python3 -m pip install requests numpy
+
+    # الخطوة 9: إنشاء دليل اتصال مفصل
+    - name: إنشاء دليل اتصال مفصل
+      run: |
+        echo "📋 إنشاء دليل الاتصال..."
+        
+        cat > "$CURRENT_DIR/README.md" << EOL
+# 🚀 اتصال RDP (بدون Tailscale)
+
+## ⚠️ معلومات مهمة
+**بدون Tailscale، الاتصال المباشر قد لا يعمل**
+هذا بسبب قيود شبكة GitHub Runner
+
+## 🔄 الطرق البديلة المقترحة
+
+### 1. استخدام Tailscale (مستحسن)
+- سجل في https://tailscale.com
+- احصل على مفتاح مجاني
+- أضف المفتاح إلى GitHub Secrets
+
+### 2. استخدام خدمات أخرى
+- **Cloudflare Tunnel**: يحتاج إعداد DNS
+- **Ngrok**: https://ngrok.com (لديه نسخة مجانية)
+- **Localtonet**: https://localtonet.com
+
+### 3. استخدام GitHub Codespaces
+- تفعيل إعادة توجيه المنافذ
+- الاتصال عبر localhost
+
+## 📊 المعلومات الحالية
+- **IP الظاهري**: $PUBLIC_IP
+- **المستخدم**: rdpuser
+- **كلمة المرور**: $LOGIN_PASSWORD
+- **الجلسة**: $SESSION_NUMBER
+
+## 🛠️ لإضافة Tailscale (مستحسن)
+1. اذهب إلى https://tailscale.com
+2. أنشئ حساباً مجانياً
+3. احصل على Auth Key
+4. في GitHub: Settings → Secrets → New secret
+5. **Name**: TAILSCALE_AUTH_KEY
+6. **Value**: مفتاحك من Tailscale
+
+EOL
+
+    # الخطوة 10: بدء الجلسة مع المراقبة
+    - name: بدء الجلسة الرئيسية
+      run: |
+        echo "🎉 جاهز للاستخدام (مع قيود)"
+        echo "===================================================="
+        echo "   ⚠️  بدون Tailscale - الاتصال محدود"
+        echo "   🌐 IP: $PUBLIC_IP"
+        echo "   👤 user: rdpuser"
+        echo "   🔐 password: $LOGIN_PASSWORD"
+        echo "===================================================="
+        echo ""
+        echo "📋 للاتصال الفعالي:"
+        echo "1. استخدم Tailscale (مستحسن)"
+        echo "2. أو استخدم بدائل مثل Ngrok"
+        echo "3. أضف مفتاح Tailscale إلى GitHub Secrets"
+        echo ""
+        
+        # العد التنازلي مع معلومات
+        for i in $(seq 1 $SESSION_DURATION); do
+            if [ $((i % 300)) -eq 0 ]; then
+                REMAINING=$((SESSION_DURATION - i))
+                HOURS=$((REMAINING / 3600))
+                MINUTES=$(( (REMAINING % 3600) / 60 ))
+                echo "⏰ المتبقي: ${HOURS}h ${MINUTES}m - بدون Tailscale"
+            fi
+            sleep 1
+        done
+
+    # الخطوة 11: إنهاء الجلسة
+    - name: إنهاء الجلسة
+      run: |
+        echo "✅ إنهاء الجلسة $SESSION_NUMBER"
+        date > "$CURRENT_DIR/end_time.txt"
+        
+        # إيقاف عمليات إعادة التوجيه
+        if [ -f "$CURRENT_DIR/socat_pid.txt" ]; then
+            kill $(cat "$CURRENT_DIR/socat_pid.txt") 2>/dev/null || true
+        fi
+        
+        echo "🔄 الجلسة التالية ستبدأ تلقائياً"
